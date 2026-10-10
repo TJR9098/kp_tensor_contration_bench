@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+bin/
+results/
+
+.venv/
+venv/
