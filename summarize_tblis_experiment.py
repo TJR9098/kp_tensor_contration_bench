@@ -141,6 +141,9 @@ def attach_thread_diagnostics(summary: list[dict[str, object]],
         row = by_key[(str(result["case_id"]), str(result["method"]))]
         result["configured_threads"] = int(row["configured_threads"])
         result["actual_active_workers"] = int(row["actual_active_workers"])
+        result["runtime_advancing_workers"] = int(
+            row.get("runtime_advancing_workers", row["actual_active_workers"])
+        )
         result["diagnostic_core_equivalents"] = float(row["process_core_equivalents"])
         result["diagnostic_capacity_utilization_pct"] = float(
             row["requested_capacity_utilization_pct"]
@@ -546,11 +549,23 @@ def conclusions(summary: list[dict[str, object]], diagnostics: list[dict[str, st
     ]
     tblis_m_x0 = by_key[("M_X0_T4", METHODS[2])]
     kml_m_x0 = by_key[("M_X0_T4", METHODS[1])]
+    layout_deltas: dict[str, dict[str, float]] = {}
+    for method in METHODS:
+        baseline_ns = float(by_key[("S_X0_T1", method)]["median_total_ns"])
+        layout_deltas[method] = {
+            layout: 100.0 * (
+                float(by_key[(f"S_{layout}_T1", method)]["median_total_ns"])
+                / baseline_ns - 1.0
+            )
+            for layout in ("X1", "X2", "X3", "X4", "X5")
+        }
+    tblis_max_layout_delta = max(abs(value) for value in layout_deltas[METHODS[2]].values())
     lines = [
         "### 主要结论", "",
         "- 物化证据链成立：X2 只复制 A（65,536 B），X3 只复制 B（65,536 B），"
         "X4/X5 都复制 A+B（131,072 B）；TBLIS 包装层完整输入物化为 0，只有内部局部 packing。",
-        "- KML 的 X4 端到端中位数比 X0 增加 19.4%，而 TBLIS 变化 -0.2%；"
+        f"- KML 的 X4 端到端中位数相对 X0 变化 {layout_deltas[METHODS[1]]['X4']:+.1f}%，"
+        f"TBLIS 变化 {layout_deltas[METHODS[2]]['X4']:+.1f}%；"
         "这把布局引入的完整输入复制与端到端差距联系起来。X5 没有比 X4 再多复制，"
         "说明更大的 backing storage 不等于更多实际物化字节。",
         f"- KML 在 XL/T4 诊断中可见多个 worker，但 X0/X4 speedup 仅 "
@@ -562,16 +577,14 @@ def conclusions(summary: list[dict[str, object]], diagnostics: list[dict[str, st
         f"M/X0 中位数为 {float(tblis_m_x0['median_total_ns'])/1000:.1f} µs，"
         f"KML 为 {float(kml_m_x0['median_total_ns'])/1000:.1f} µs。",
         "- X1 没有输入 clone，证明整组转置可以保持为矩阵转置视图；X2-X5 才触发复杂矩阵化。"
-        "TBLIS 的 X0-X5 中位数差异均在 ±0.23% 内。",
+        f"TBLIS 的 X1-X5 相对 X0 的中位数差异均在 ±{tblis_max_layout_delta:.2f}% 内。",
         "", "### 明细判读", "",
     ]
     for method in METHODS:
-        baseline = by_key[("S_X0_T1", method)]
-        parts = []
-        for layout in ("X1", "X2", "X3", "X4", "X5"):
-            row = by_key[(f"S_{layout}_T1", method)]
-            delta = 100.0 * (float(row["median_total_ns"]) / float(baseline["median_total_ns"]) - 1.0)
-            parts.append(f"{layout} {delta:+.1f}%")
+        parts = [
+            f"{layout} {delta:+.1f}%"
+            for layout, delta in layout_deltas[method].items()
+        ]
         lines.append(f"- `{method}` 相对 X0 的端到端变化：" + "，".join(parts) + "。")
     for method in METHODS[:2]:
         parts = []
@@ -611,6 +624,7 @@ PyTorch 2.5.0 的 einsum 规约路径是 `permute -> reshape -> bmm -> view/perm
 
 - FP32 被测计算；每个逻辑规模只生成一次 FP64 `torch.mm` 参考结果。
 - {campaigns} 个独立 campaign，每组每轮 warmup 10 次、记录 50 个原始样本。
+- P95 使用 nearest-rank 定义：排序后取第 `ceil(0.95 * n)` 个样本，不做线性插值。
 - T1 绑定 CPU3，T2 绑定 CPU2-3，T4 绑定 CPU0-3；机器只有 4 个物理核，T8 明确不运行。
 - 性能采样不启用 PyTorch profiler；物化、worker 和 timeline 来自独立诊断运行。
 - 相对误差分母为 `max(abs(reference), 1)`，阈值 `1e-4`。
@@ -708,6 +722,14 @@ def main() -> None:
         assert tblis_meta["a_entry"]["data_ptr"] == tblis_meta["tblis_a_data_ptr"]
         assert tblis_meta["b_entry"]["data_ptr"] == tblis_meta["tblis_b_data_ptr"]
     assert max(float(row["max_rel_error"]) for row in summary) <= 1.0e-4
+    tblis_thread_rows = [
+        row for row in thread_rows if row["method"] == "tblis_2.0_armsve"
+    ]
+    assert all(
+        int(row["configured_threads"]) == int(row["threads"])
+        and int(row["actual_active_workers"]) == int(row["threads"])
+        for row in tblis_thread_rows
+    ), "TBLIS configured/observed worker count mismatch"
 
     native_meta = metadata[(next(iter(cases)), METHODS[0])]
     kml_meta = metadata[(next(iter(cases)), METHODS[1])]
@@ -763,6 +785,7 @@ def main() -> None:
         f"PASS: every group contains {campaigns} campaigns x 50 samples",
         "PASS: logical input SHA256 and entry strides match across all three methods",
         "PASS: TBLIS wrapper entry data pointers equal pointers passed to TBLIS",
+        "PASS: TBLIS configured threads and observed peak concurrent workers match",
         "PASS: official OpenBLAS and patched SVE/locking KML runtime linkage verified",
         f"PASS: maximum relative error {max(float(row['max_rel_error']) for row in summary):.3e} <= 1e-4",
         f"PASS: {len(thread_rows)} worker diagnostics and {len(materialization_rows)} materialization diagnostics",

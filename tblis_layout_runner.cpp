@@ -13,7 +13,6 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <openssl/sha.h>
 #include <sstream>
 #include <stdexcept>
@@ -221,6 +220,9 @@ Record execute(const Operand& a, const Operand& b, std::vector<float>& c,
                const std::vector<tblis::label_type>& a_labels,
                const std::vector<tblis::label_type>& b_labels,
                const std::vector<tblis::label_type>& c_labels) {
+    tblis_profile_reset();
+    const auto cpu_begin = process_cpu_ns();
+    const auto total_begin = Clock::now();
     auto a_shape = a.shape;
     auto b_shape = b.shape;
     auto mutable_a_strides = a.strides;
@@ -237,9 +239,6 @@ Record execute(const Operand& a, const Operand& b, std::vector<float>& c,
     tblis::tblis_init_tensor_scaled_s(
         &c_tensor, 0.0F, static_cast<int>(mutable_c_shape.size()),
         mutable_c_shape.data(), c.data(), mutable_c_strides.data());
-    tblis_profile_reset();
-    const auto cpu_begin = process_cpu_ns();
-    const auto total_begin = Clock::now();
     tblis::tblis_tensor_mult(nullptr, nullptr, &a_tensor, a_labels.data(),
                              &b_tensor, b_labels.data(), &c_tensor, c_labels.data());
     Record record;
@@ -281,6 +280,7 @@ std::pair<double, double> validate(const std::vector<float>& actual,
 
 struct TaskInfo {
     std::uint64_t ticks = 0;
+    std::uint64_t runtime_ns = 0;
     std::string name;
     std::string affinity;
 };
@@ -300,23 +300,12 @@ std::map<pid_t, TaskInfo> task_snapshot() {
         if (fields.size() < 13) continue;
         TaskInfo info;
         info.ticks = std::stoull(fields[11]) + std::stoull(fields[12]);
+        std::ifstream schedstat(entry.path() / "schedstat");
+        if (!(schedstat >> info.runtime_ns)) continue;
         info.name = line.substr(line.find('(') + 1, close - line.find('(') - 1);
         try { info.affinity = affinity_text(tid); }
         catch (const std::exception&) { continue; }
         result[tid] = std::move(info);
-    }
-    return result;
-}
-
-std::vector<pid_t> task_ids() {
-    std::vector<pid_t> result;
-    for (const auto& entry : fs::directory_iterator("/proc/self/task")) {
-        const std::string name = entry.path().filename().string();
-        if (std::all_of(name.begin(), name.end(), [](const unsigned char value) {
-                return std::isdigit(value) != 0;
-            })) {
-            result.push_back(static_cast<pid_t>(std::stoi(name)));
-        }
     }
     return result;
 }
@@ -326,6 +315,7 @@ struct WorkerDiagnostic {
     std::uint64_t wall_ns = 0;
     std::uint64_t cpu_ns = 0;
     std::vector<std::pair<pid_t, TaskInfo>> active;
+    std::size_t runtime_advancing_workers = 0;
     std::size_t all_tasks = 0;
 };
 
@@ -339,28 +329,27 @@ WorkerDiagnostic diagnose_workers(
     WorkerDiagnostic result;
     result.iterations = static_cast<int>(std::min<std::uint64_t>(
         20000, std::max<std::uint64_t>(1, (kDiagnosticTargetNs + median_ns - 1) / median_ns)));
+    const auto before = task_snapshot();
     std::atomic<bool> stop_monitor{false};
     std::atomic<pid_t> monitor_tid{0};
-    std::mutex peak_mutex;
-    std::map<pid_t, TaskInfo> peak_tasks;
+    std::map<pid_t, TaskInfo> peak_tasks = before;
+    std::map<pid_t, TaskInfo> peak_active;
     std::thread monitor([&] {
         const auto tid = static_cast<pid_t>(syscall(SYS_gettid));
         monitor_tid.store(tid, std::memory_order_release);
         while (!stop_monitor.load(std::memory_order_acquire)) {
-            auto ids = task_ids();
-            ids.erase(std::remove(ids.begin(), ids.end(), tid), ids.end());
-            std::size_t peak_size = 0;
-            {
-                std::lock_guard<std::mutex> lock(peak_mutex);
-                peak_size = peak_tasks.size();
+            auto snapshot = task_snapshot();
+            snapshot.erase(tid);
+            std::map<pid_t, TaskInfo> active;
+            for (const auto& [task_tid, info] : snapshot) {
+                const auto previous = before.find(task_tid);
+                const std::uint64_t previous_runtime =
+                    previous == before.end() ? 0 : previous->second.runtime_ns;
+                if (info.runtime_ns > previous_runtime) active.emplace(task_tid, info);
             }
-            if (ids.size() > peak_size) {
-                auto snapshot = task_snapshot();
-                snapshot.erase(tid);
-                std::lock_guard<std::mutex> lock(peak_mutex);
-                if (snapshot.size() > peak_tasks.size()) peak_tasks = std::move(snapshot);
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(750));
+            if (snapshot.size() > peak_tasks.size()) peak_tasks = snapshot;
+            if (active.size() > peak_active.size()) peak_active = std::move(active);
+            std::this_thread::sleep_for(std::chrono::microseconds(250));
         }
     });
     while (monitor_tid.load(std::memory_order_acquire) == 0) std::this_thread::yield();
@@ -372,6 +361,17 @@ WorkerDiagnostic diagnose_workers(
     result.cpu_ns = process_cpu_ns() - cpu_begin;
     stop_monitor.store(true, std::memory_order_release);
     monitor.join();
+    auto after = task_snapshot();
+    std::map<pid_t, TaskInfo> final_active;
+    for (const auto& [tid, info] : after) {
+        const auto previous = before.find(tid);
+        const std::uint64_t previous_runtime =
+            previous == before.end() ? 0 : previous->second.runtime_ns;
+        if (info.runtime_ns > previous_runtime) final_active.emplace(tid, info);
+    }
+    if (final_active.size() > peak_active.size()) peak_active = std::move(final_active);
+    if (after.size() > peak_tasks.size()) peak_tasks = std::move(after);
+    result.runtime_advancing_workers = peak_active.size();
     result.all_tasks = peak_tasks.size();
     for (auto& [tid, info] : peak_tasks) result.active.emplace_back(tid, std::move(info));
     return result;
@@ -515,7 +515,8 @@ int main(int argc, char** argv) {
             fs::create_directories(thread_path.parent_path());
             std::ofstream thread(thread_path);
             thread << "case_id\tmethod\tcampaign\tthreads\tconfigured_threads"
-                      "\tactual_active_workers\tactive_worker_tids\tactive_worker_affinities"
+                      "\tactual_active_workers\truntime_advancing_workers"
+                      "\tactive_worker_tids\tactive_worker_affinities"
                       "\tdiagnostic_iterations\tdiagnostic_wall_ns\tdiagnostic_process_cpu_ns"
                       "\tprocess_core_equivalents\trequested_capacity_utilization_pct"
                       "\tall_task_count\tmeasurement_scope\n";
@@ -527,6 +528,7 @@ int main(int argc, char** argv) {
             }
             thread << item.at("case_id") << "\ttblis_2.0_armsve\t" << campaign << '\t'
                    << threads << '\t' << tblis_get_num_threads() << '\t' << worker.active.size()
+                   << '\t' << worker.runtime_advancing_workers
                    << '\t' << tids.str() << '\t' << affinities.str() << '\t' << worker.iterations
                    << '\t' << worker.wall_ns << '\t' << worker.cpu_ns << '\t'
                    << static_cast<double>(worker.cpu_ns) / worker.wall_ns << '\t'

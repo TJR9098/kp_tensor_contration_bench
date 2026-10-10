@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import os
 import random
@@ -23,6 +24,14 @@ METHODS = [
     "pytorch_2.5.0_kml_patched",
     "tblis_2.0_armsve",
 ]
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def read_manifest(path: Path) -> list[dict[str, str]]:
@@ -124,6 +133,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--case", action="append", help="run only the named case; repeatable")
     parser.add_argument("--method", action="append", choices=METHODS)
+    parser.add_argument("--shuffle-seed", type=int, default=20261010)
     args = parser.parse_args()
     if args.campaigns < 1:
         raise SystemExit("campaigns must be positive")
@@ -161,6 +171,7 @@ def main() -> None:
         "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "manifest": str(MANIFEST.resolve()), "methods": methods,
         "campaigns": args.campaigns, "warmup": 10, "repeat_per_campaign": 50,
+        "shuffle_seed": args.shuffle_seed,
         "equation": "abkl,klcd->abcd", "dtype": "float32",
         "reference": "shared FP64 torch.mm by logical scale",
         "host_affinity": sorted(os.sched_getaffinity(0)),
@@ -169,6 +180,15 @@ def main() -> None:
         "estimated_bandwidth": "minimum logical bytes divided by end-to-end time",
         "pytorch_runner": str((ROOT / "benchmark_tblis_pytorch.py").resolve()),
         "tblis_runner": str((ROOT / "bin/tblis_layout_runner").resolve()),
+        "artifact_sha256": {
+            "manifest": sha256_file(MANIFEST),
+            "pytorch_runner": sha256_file(ROOT / "benchmark_tblis_pytorch.py"),
+            "tblis_runner_source": sha256_file(ROOT / "tblis_layout_runner.cpp"),
+            "tblis_runner_binary": sha256_file(ROOT / "bin/tblis_layout_runner"),
+            "tblis_library": sha256_file(
+                TBLIS_ROOT / "install/tblis-2.0-armsve/lib/libtblis.so"
+            ),
+        },
     }
     (output / "provenance.json").write_text(
         json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
@@ -179,7 +199,7 @@ def main() -> None:
         for case in cases
         for method in methods
     ]
-    random.Random(20261010).shuffle(tasks)
+    random.Random(args.shuffle_seed).shuffle(tasks)
     if args.limit is not None:
         tasks = tasks[:args.limit]
     log_path = output / "run.log"
