@@ -282,12 +282,19 @@ METHOD_COLORS = {
 
 
 def cdf_path(values_ns: list[int], x0: float, y0: float, width: float,
-             height: float, minimum_us: float, maximum_us: float) -> str:
+             height: float, minimum_us: float, maximum_us: float,
+             x_scale: str = "linear") -> str:
     ordered = sorted(value / 1000.0 for value in values_ns)
-    span = maximum_us - minimum_us
+    if x_scale == "log":
+        scale_minimum = math.log10(minimum_us)
+        span = math.log10(maximum_us) - scale_minimum
+    else:
+        scale_minimum = minimum_us
+        span = maximum_us - minimum_us
 
     def x(value: float) -> float:
-        return x0 + width * (value - minimum_us) / span
+        scaled = math.log10(value) if x_scale == "log" else value
+        return x0 + width * (scaled - scale_minimum) / span
 
     def y(value: float) -> float:
         return y0 + height * (1.0 - value)
@@ -304,7 +311,10 @@ def cdf_path(values_ns: list[int], x0: float, y0: float, width: float,
 
 def write_cdf_grid(path: Path, title: str,
                    panels: list[tuple[str, list[dict[str, object]]]],
-                   columns: int) -> None:
+                   columns: int, x_scale: str = "linear",
+                   subtitle: str | None = None) -> None:
+    if x_scale not in {"linear", "log"}:
+        raise ValueError(f"unsupported CDF x scale: {x_scale}")
     panel_width, panel_height = 490, 300
     plot_left, plot_top, plot_width, plot_height = 68, 37, 386, 210
     top, legend_height = 62, 40
@@ -315,7 +325,7 @@ def write_cdf_grid(path: Path, title: str,
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         f'<text x="18" y="28" font-family="sans-serif" font-size="19" font-weight="600">{html.escape(title)}</text>',
-        '<text x="18" y="49" font-family="sans-serif" font-size="11" fill="#555">横轴：端到端耗时（µs）；纵轴：经验 CDF；每条曲线合并 3 个 campaign 的 150 个非 profiler 原始样本。</text>',
+        f'<text x="18" y="49" font-family="sans-serif" font-size="11" fill="#555">{html.escape(subtitle or "横轴：端到端耗时（µs）；纵轴：经验 CDF；每条曲线合并 3 个 campaign 的 150 个非 profiler 原始样本。")}</text>',
     ]
     legends: list[tuple[str, str, str]] = []
     for _, curves in panels:
@@ -348,9 +358,15 @@ def write_cdf_grid(path: Path, title: str,
         all_values = [value for curve in curves for value in curve["values"]]
         minimum_us = min(all_values) / 1000.0
         maximum_us = max(all_values) / 1000.0
-        padding = max((maximum_us - minimum_us) * 0.04, maximum_us * 0.002, 0.01)
-        minimum_us = max(0.0, minimum_us - padding)
-        maximum_us += padding
+        if x_scale == "log":
+            if minimum_us <= 0:
+                raise ValueError("logarithmic CDF requires positive timings")
+            minimum_us *= 0.95
+            maximum_us *= 1.05
+        else:
+            padding = max((maximum_us - minimum_us) * 0.04, maximum_us * 0.002, 0.01)
+            minimum_us = max(0.0, minimum_us - padding)
+            maximum_us += padding
         if maximum_us <= minimum_us:
             maximum_us = minimum_us + 1.0
         svg.append(
@@ -364,9 +380,20 @@ def write_cdf_grid(path: Path, title: str,
         for tick in range(5):
             fraction = tick / 4
             x = x0 + fraction * plot_width
-            value = minimum_us + fraction * (maximum_us - minimum_us)
+            if x_scale == "log":
+                value = 10 ** (
+                    math.log10(minimum_us)
+                    + fraction * (math.log10(maximum_us) - math.log10(minimum_us))
+                )
+            else:
+                value = minimum_us + fraction * (maximum_us - minimum_us)
             svg.append(f'<line x1="{x:.2f}" y1="{y0}" x2="{x:.2f}" y2="{y0+plot_height}" stroke="#e5e5e5"/>')
-            svg.append(f'<text x="{x:.2f}" y="{y0+plot_height+17}" text-anchor="middle" font-family="sans-serif" font-size="9">{value:.1f}</text>')
+            tick_label = (
+                f"{value:.1f}"
+                if x_scale == "linear" or value < 100
+                else f"{value:.0f}"
+            )
+            svg.append(f'<text x="{x:.2f}" y="{y0+plot_height+17}" text-anchor="middle" font-family="sans-serif" font-size="9">{tick_label}</text>')
         for tick in range(5):
             fraction = tick / 4
             y = y0 + plot_height * (1 - fraction)
@@ -377,7 +404,7 @@ def write_cdf_grid(path: Path, title: str,
             dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
             path_data = cdf_path(
                 list(curve["values"]), x0, y0, plot_width, plot_height,
-                minimum_us, maximum_us,
+                minimum_us, maximum_us, x_scale,
             )
             svg.append(
                 f'<path d="{path_data}" fill="none" stroke="{curve["color"]}" '
@@ -385,7 +412,7 @@ def write_cdf_grid(path: Path, title: str,
             )
         svg.append(
             f'<text x="{x0+plot_width/2}" y="{y0+plot_height+34}" text-anchor="middle" '
-            f'font-family="sans-serif" font-size="10">端到端耗时（µs）</text>'
+            f'font-family="sans-serif" font-size="10">端到端耗时（µs{", log" if x_scale == "log" else ""}）</text>'
         )
         svg.append(
             f'<text x="{base_x+15}" y="{y0+plot_height/2}" text-anchor="middle" '
