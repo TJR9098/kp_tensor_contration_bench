@@ -1,0 +1,42 @@
+--- LinearAlgebra.cpp
++++ LinearAlgebra.cpp
+@@ -23,6 +23,8 @@
+ #include <c10/core/GradMode.h>
+ #include <c10/util/accumulate.h>
+ #include <c10/util/irange.h>
++#include <cstdlib>
++#include <cstring>
+ #include <variant>
+ 
+ #ifndef AT_PER_OPERATOR_HEADERS
+@@ -1696,9 +1698,15 @@
+   const int64_t b_batch_stride = b.strides()[0];
+   const int64_t c_batch_stride = c.strides()[0];
+ 
++  // Experimental process-local schedule; BLAS thread counts are set by launcher.
++  const char* schedule = std::getenv("KML_BMM_SCHEDULE");
++  TORCH_CHECK(!schedule || std::strcmp(schedule, "inter") == 0 ||
++              std::strcmp(schedule, "intra") == 0, "Invalid KML_BMM_SCHEDULE");
++  const bool intra = schedule && std::strcmp(schedule, "intra") == 0;
++
+   _AT_DISPATCH_ADDMM_TYPES(result.scalar_type(), "bmm_impl_cpu_", [&]{
+     using opmath_t = at::opmath_type<scalar_t>;
+-    at::parallel_for(0, bs, 1, [&](uint64_t start, uint64_t end) {
++    const auto execute_batches = [&](uint64_t start, uint64_t end) {
+       for (const auto batch : c10::irange(start, end)) {
+         at::native::cpublas::gemm(
+             transpose_a ? a.is_conj() ? TransposeType::ConjTranspose : TransposeType::Transpose : TransposeType::NoTranspose,
+@@ -1710,7 +1718,12 @@
+             beta.to<opmath_t>(),
+             c.mutable_data_ptr<scalar_t>() + c_batch_stride * batch, ldc);
+       }
+-    });
++    };
++    if (intra) {
++      execute_batches(0, bs);
++    } else {
++      at::parallel_for(0, bs, 1, execute_batches);
++    }
+   });
+ 
+   if (!c.is_same(result)) {
